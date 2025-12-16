@@ -19,7 +19,7 @@ from runwayml import RunwayML
 class VideoGenerationPipeline:
     def __init__(self):
         self.openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-        self.runway = RunwayML(api_key=os.environ.get('RUNWAYML_API_SECRET'))
+        self.runway = RunwayML(api_key=os.environ.get('RUNWAY_API_KEY'))
         self.work_dir = Path('video_work')
         self.work_dir.mkdir(exist_ok=True)
     
