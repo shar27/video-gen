@@ -11,11 +11,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-CORS(app, origins=[
-    "http://localhost:5173",
-    "http://localhost:3000",
-    # Add your Azure frontend URL here
-])
+CORS(app)
 
 # Configuration
 UPLOAD_FOLDER = Path('uploads')
