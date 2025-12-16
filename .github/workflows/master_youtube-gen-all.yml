@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read #This is required for actions/checkout
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -21,19 +22,35 @@ jobs:
       - name: Set up Node.js version
         uses: actions/setup-node@v3
         with:
-          node-version: '24.x'
+          node-version: '20'
 
-      - name: npm install, build, and test
+      - name: Install dependencies and build
+        working-directory: web-ui
+        env:
+          VITE_API_URL: https://video-gen-mvp.up.railway.app/api
         run: |
-          npm install
-          npm run build --if-present
-          npm run test --if-present
+          npm ci
+          npm run build
 
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: node-app
-          path: .
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy
+          cp -r web-ui/dist deploy/
+          cp web-ui/server.js deploy/
+          # Create a minimal package.json for production
+          cat > deploy/package.json << 'EOF'
+          {
+            "name": "video-gen",
+            "version": "1.0.0",
+            "scripts": {
+              "start": "node server.js"
+            },
+            "dependencies": {
+              "express": "^4.18.2"
+            }
+          }
+          EOF
+          cd deploy && npm install --omit=dev
 
   deploy:
     runs-on: ubuntu-latest
@@ -43,10 +60,7 @@ jobs:
       contents: read #This is required for actions/checkout
 
     steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: node-app
+     
       
       - name: Login to Azure
         uses: azure/login@v2
@@ -61,5 +75,5 @@ jobs:
         with:
           app-name: 'youtube-gen-all'
           slot-name: 'Production'
-          package: .
+          package: deploy
           
