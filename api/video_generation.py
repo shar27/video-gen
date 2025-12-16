@@ -1,0 +1,487 @@
+"""
+Video Generation Pipeline
+- Takes an image + script
+- Uses Runway Gen-4 to generate video from image
+- Converts script to speech using OpenAI TTS
+- Merges video + audio with FFmpeg
+- Outputs YouTube-ready video
+"""
+
+import os
+import base64
+import time
+from pathlib import Path
+from openai import OpenAI
+import runwayml
+from runwayml import RunwayML
+
+
+class VideoGenerationPipeline:
+    def __init__(self):
+        self.openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
+        self.runway = RunwayML(api_key=os.environ.get('RUNWAYML_API_SECRET'))
+        self.work_dir = Path('video_work')
+        self.work_dir.mkdir(exist_ok=True)
+    
+    def generate_video_from_image(self, image_path: str, motion_prompt: str, duration: int = 10) -> str:
+        """
+        Generate video from image using Runway Gen-4 Turbo
+        
+        Args:
+            image_path: Path to source image or URL
+            motion_prompt: Text describing the desired motion/animation
+            duration: Video duration in seconds (5 or 10)
+            
+        Returns:
+            Path to downloaded video file
+        """
+        print(f"🎬 Generating video from image with Runway...")
+        print(f"   Motion prompt: {motion_prompt}")
+        print(f"   Duration: {duration}s")
+        
+        # Prepare image - either URL or base64
+        if image_path.startswith('http'):
+            prompt_image = image_path
+        else:
+            # Read and encode local file
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+            
+            # Detect mime type
+            if image_path.lower().endswith('.png'):
+                mime_type = 'image/png'
+            elif image_path.lower().endswith('.webp'):
+                mime_type = 'image/webp'
+            else:
+                mime_type = 'image/jpeg'
+            
+            prompt_image = f"data:{mime_type};base64,{base64.b64encode(image_data).decode()}"
+        
+        try:
+            # Create image-to-video task
+            task = self.runway.image_to_video.create(
+                model='gen4_turbo',
+                prompt_image=prompt_image,
+                prompt_text=motion_prompt,
+                duration=duration,
+                ratio='1280:720'  # 16:9 for YouTube
+            )
+            
+            print(f"   Task created: {task.id}")
+            print(f"   Waiting for generation (this may take 1-3 minutes)...")
+            
+            # Poll for completion
+            while True:
+                task_status = self.runway.tasks.retrieve(task.id)
+                status = task_status.status
+                
+                if status == 'SUCCEEDED':
+                    video_url = task_status.output[0]
+                    print(f"   ✅ Video generated successfully!")
+                    break
+                elif status == 'FAILED':
+                    error = getattr(task_status, 'failure', 'Unknown error')
+                    raise Exception(f"Runway generation failed: {error}")
+                elif status in ['PENDING', 'RUNNING']:
+                    print(f"   Status: {status}...")
+                    time.sleep(5)
+                else:
+                    print(f"   Status: {status}")
+                    time.sleep(5)
+            
+            # Download the video
+            import requests
+            video_filename = self.work_dir / f"runway_video_{task.id}.mp4"
+            
+            print(f"   Downloading video...")
+            response = requests.get(video_url)
+            with open(video_filename, 'wb') as f:
+                f.write(response.content)
+            
+            print(f"   ✅ Video saved: {video_filename}")
+            return str(video_filename)
+            
+        except Exception as e:
+            print(f"   ❌ Error generating video: {e}")
+            raise
+    
+    def convert_script_to_speech(self, script: str, output_path: str, voice: str = 'onyx') -> str:
+        """
+        Convert script to speech using OpenAI TTS
+        Handles scripts longer than 4096 characters by chunking
+        
+        Args:
+            script: The commentary script text
+            output_path: Where to save the audio file
+            voice: OpenAI TTS voice (alloy, echo, fable, onyx, nova, shimmer)
+            
+        Returns:
+            Path to audio file
+        """
+        print(f"🎙️ Converting script to speech (voice: {voice})...")
+        
+        MAX_CHARS = 4000  # Leave buffer under 4096 limit
+        output_path = Path(output_path)
+        
+        # If script is short enough, process directly
+        if len(script) <= MAX_CHARS:
+            response = self.openai.audio.speech.create(
+                model="tts-1-hd",
+                voice=voice,
+                input=script,
+                speed=1.0
+            )
+            response.stream_to_file(str(output_path))
+            print(f"   ✅ Audio saved: {output_path}")
+            return str(output_path)
+        
+        # Split long scripts into chunks
+        print(f"   Script is {len(script)} chars, splitting into chunks...")
+        chunks = self._split_script_into_chunks(script, MAX_CHARS)
+        print(f"   Split into {len(chunks)} chunks")
+        
+        # Generate audio for each chunk
+        import subprocess
+        temp_files = []
+        
+        for i, chunk in enumerate(chunks):
+            print(f"   Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+            temp_path = output_path.parent / f"{output_path.stem}_chunk_{i}.mp3"
+            
+            response = self.openai.audio.speech.create(
+                model="tts-1-hd",
+                voice=voice,
+                input=chunk,
+                speed=1.0
+            )
+            response.stream_to_file(str(temp_path))
+            temp_files.append(temp_path)
+        
+        # Concatenate audio files using ffmpeg
+        print(f"   Concatenating {len(temp_files)} audio chunks...")
+        
+        list_file = output_path.parent / f"{output_path.stem}_filelist.txt"
+        with open(list_file, 'w') as f:
+            for temp_file in temp_files:
+                f.write(f"file '{temp_file.name}'\n")
+        
+        subprocess.run([
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+            '-i', str(list_file),
+            '-c', 'copy',
+            '-y', str(output_path)
+        ], check=True, capture_output=True)
+        
+        # Cleanup temp files
+        for temp_file in temp_files:
+            temp_file.unlink()
+        list_file.unlink()
+        
+        print(f"   ✅ Audio saved: {output_path}")
+        return str(output_path)
+    
+    def _split_script_into_chunks(self, script: str, max_chars: int) -> list:
+        """Split script into chunks respecting sentence boundaries"""
+        chunks = []
+        current_chunk = ""
+        
+        paragraphs = script.split('\n\n')
+        
+        for para in paragraphs:
+            if len(current_chunk) + len(para) + 2 <= max_chars:
+                current_chunk += para + '\n\n'
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                
+                if len(para) > max_chars:
+                    # Split by sentences
+                    sentences = para.replace('. ', '.|').split('|')
+                    current_chunk = ""
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) + 1 <= max_chars:
+                            current_chunk += sentence + ' '
+                        else:
+                            if current_chunk:
+                                chunks.append(current_chunk.strip())
+                            current_chunk = sentence + ' '
+                else:
+                    current_chunk = para + '\n\n'
+        
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def merge_video_audio(self, video_path: str, audio_path: str, output_path: str) -> str:
+        """
+        Merge video with audio commentary using FFmpeg
+        
+        Args:
+            video_path: Path to video file
+            audio_path: Path to audio commentary
+            output_path: Where to save final video
+            
+        Returns:
+            Path to final video
+        """
+        import subprocess
+        
+        print(f"🔀 Merging video and audio...")
+        
+        # Get durations
+        video_duration = self._get_media_duration(video_path)
+        audio_duration = self._get_media_duration(audio_path)
+        
+        print(f"   Video duration: {video_duration:.1f}s")
+        print(f"   Audio duration: {audio_duration:.1f}s")
+        
+        # Strategy: 
+        # - If audio is shorter, video plays with audio then continues silent
+        # - If audio is longer, loop/extend video or trim audio
+        
+        if audio_duration <= video_duration:
+            # Simple case: audio fits within video
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-i', audio_path,
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-shortest',
+                output_path
+            ]
+        else:
+            # Audio is longer - loop video to match audio length
+            print(f"   Looping video to match audio length...")
+            cmd = [
+                'ffmpeg', '-y',
+                '-stream_loop', '-1',  # Loop video infinitely
+                '-i', video_path,
+                '-i', audio_path,
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-t', str(audio_duration),  # Trim to audio length
+                '-shortest',
+                output_path
+            ]
+        
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"   ✅ Final video saved: {output_path}")
+        return output_path
+    
+    def _get_media_duration(self, file_path: str) -> float:
+        """Get duration of media file in seconds"""
+        import subprocess
+        import json
+        
+        result = subprocess.run([
+            'ffprobe', '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            file_path
+        ], capture_output=True, text=True)
+        
+        data = json.loads(result.stdout)
+        return float(data['format']['duration'])
+    
+    def generate_youtube_metadata(self, script: str, topic: str = None) -> dict:
+        """
+        Generate YouTube title, description and tags using AI
+        
+        Args:
+            script: The commentary script
+            topic: Optional topic/theme
+            
+        Returns:
+            Dictionary with title, description, tags
+        """
+        print(f"📝 Generating YouTube metadata...")
+        
+        prompt = f"""Based on this video commentary script, generate YouTube metadata.
+
+Script:
+{script[:2000]}
+
+Generate:
+1. An engaging YouTube title (max 100 chars, include emoji)
+2. A compelling description (include call to action, hashtags)
+3. 10-15 relevant tags for SEO
+
+Format your response as:
+TITLE: [title here]
+DESCRIPTION: [description here]
+TAGS: tag1, tag2, tag3, ...
+"""
+        
+        response = self.openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000
+        )
+        
+        content = response.choices[0].message.content
+        
+        # Parse response
+        metadata = {'title': '', 'description': '', 'tags': []}
+        
+        for line in content.split('\n'):
+            if line.startswith('TITLE:'):
+                metadata['title'] = line.replace('TITLE:', '').strip()
+            elif line.startswith('DESCRIPTION:'):
+                metadata['description'] = line.replace('DESCRIPTION:', '').strip()
+            elif line.startswith('TAGS:'):
+                tags_str = line.replace('TAGS:', '').strip()
+                metadata['tags'] = [t.strip() for t in tags_str.split(',')]
+        
+        print(f"   ✅ Metadata generated")
+        return metadata
+    
+    def process(self, image_path: str, script: str, motion_prompt: str = None, 
+                voice: str = 'onyx', duration: int = 10) -> dict:
+        """
+        Full pipeline: image + script -> YouTube-ready video
+        
+        Args:
+            image_path: Path to source image (local or URL)
+            script: Commentary script to narrate
+            motion_prompt: Prompt describing video motion (optional, generated if not provided)
+            voice: TTS voice to use
+            duration: Runway video duration (5 or 10 seconds)
+            
+        Returns:
+            Dictionary with file paths and metadata
+        """
+        print("\n" + "="*70)
+        print("🎬 STARTING VIDEO GENERATION PIPELINE")
+        print("="*70 + "\n")
+        
+        # Create job directory
+        import uuid
+        job_id = str(uuid.uuid4())[:8]
+        job_dir = self.work_dir / job_id
+        job_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Step 1: Generate motion prompt if not provided
+            if not motion_prompt:
+                print("Step 1: Generating motion prompt from script...")
+                motion_prompt = self._generate_motion_prompt(script)
+            else:
+                print("Step 1: Using provided motion prompt")
+            print(f"   Motion: {motion_prompt}\n")
+            
+            # Step 2: Generate video from image
+            print("-"*70)
+            print("Step 2: GENERATING VIDEO FROM IMAGE")
+            print("-"*70)
+            video_path = self.generate_video_from_image(
+                image_path, 
+                motion_prompt, 
+                duration=duration
+            )
+            print()
+            
+            # Step 3: Convert script to speech
+            print("-"*70)
+            print("Step 3: CONVERTING SCRIPT TO SPEECH")
+            print("-"*70)
+            audio_path = str(job_dir / "commentary.mp3")
+            self.convert_script_to_speech(script, audio_path, voice=voice)
+            print()
+            
+            # Step 4: Merge video and audio
+            print("-"*70)
+            print("Step 4: MERGING VIDEO AND AUDIO")
+            print("-"*70)
+            final_video = str(job_dir / "final_video.mp4")
+            self.merge_video_audio(video_path, audio_path, final_video)
+            print()
+            
+            # Step 5: Generate YouTube metadata
+            print("-"*70)
+            print("Step 5: GENERATING YOUTUBE METADATA")
+            print("-"*70)
+            metadata = self.generate_youtube_metadata(script)
+            print()
+            
+            # Save script and metadata
+            with open(job_dir / "script.txt", 'w') as f:
+                f.write(script)
+            
+            import json
+            with open(job_dir / "metadata.json", 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print("="*70)
+            print("✅ PIPELINE COMPLETE!")
+            print("="*70)
+            
+            return {
+                'job_id': job_id,
+                'video_path': final_video,
+                'audio_path': audio_path,
+                'script_path': str(job_dir / "script.txt"),
+                'metadata': metadata,
+                'files': {
+                    'video': final_video,
+                    'audio': audio_path,
+                    'script': str(job_dir / "script.txt"),
+                    'metadata': str(job_dir / "metadata.json")
+                }
+            }
+            
+        except Exception as e:
+            print(f"\n❌ PIPELINE FAILED: {e}")
+            raise
+    
+    def _generate_motion_prompt(self, script: str) -> str:
+        """Generate a motion prompt based on the script content"""
+        prompt = f"""Based on this commentary script, generate a short motion/animation prompt for AI video generation.
+
+Script:
+{script[:1000]}
+
+Generate a concise prompt (max 50 words) describing subtle, professional motion that would complement this narration. Focus on:
+- Gentle camera movements (slow pan, slight zoom)
+- Ambient motion (particles, light shifts, subtle animations)
+- Professional documentary style
+
+Return ONLY the motion prompt, nothing else."""
+
+        response = self.openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        
+        return response.choices[0].message.content.strip()
+
+
+# CLI interface for testing
+if __name__ == "__main__":
+    import sys
+    
+    pipeline = VideoGenerationPipeline()
+    
+    # Example usage
+    if len(sys.argv) >= 3:
+        image_path = sys.argv[1]
+        script = sys.argv[2]
+        motion_prompt = sys.argv[3] if len(sys.argv) > 3 else None
+        
+        result = pipeline.process(
+            image_path=image_path,
+            script=script,
+            motion_prompt=motion_prompt
+        )
+        
+        print(f"\nOutput files:")
+        for key, path in result['files'].items():
+            print(f"  {key}: {path}")
+    else:
+        print("Usage: python video_generation.py <image_path> <script> [motion_prompt]")
