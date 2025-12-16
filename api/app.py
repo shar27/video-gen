@@ -30,7 +30,7 @@ def get_pipeline():
     global pipeline, pipeline_error
     if pipeline is None and pipeline_error is None:
         try:
-            from api.video_generation import VideoGenerationPipeline
+            from video_generation import VideoGenerationPipeline
             pipeline = VideoGenerationPipeline()
         except Exception as e:
             pipeline_error = str(e)
