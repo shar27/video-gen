@@ -29,7 +29,7 @@ jobs:
         env:
           VITE_API_URL: https://video-gen-mvp.up.railway.app/api
         run: |
-          npm ci
+          npm install
           npm run build
 
       - name: Prepare deployment package
