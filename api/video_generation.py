@@ -1,7 +1,7 @@
 """
 Video Generation Pipeline
 - Takes an image + script
-- Uses Runway Gen-4 to generate video from image
+- Uses Kling AI to generate video from image
 - Converts script to speech using OpenAI TTS
 - Merges video + audio with FFmpeg
 - Outputs YouTube-ready video
@@ -10,22 +10,41 @@ Video Generation Pipeline
 import os
 import base64
 import time
+import jwt
+import requests
 from pathlib import Path
 from openai import OpenAI
-import runwayml
-from runwayml import RunwayML
 
 
 class VideoGenerationPipeline:
     def __init__(self):
         self.openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
-        self.runway = RunwayML(api_key=os.environ.get('RUNWAY_API_KEY'))
+        self.kling_access_key = os.environ.get('KLING_ACCESS_KEY')
+        self.kling_secret_key = os.environ.get('KLING_SECRET_KEY')
+        self.kling_api_base = os.environ.get('KLING_API_BASE', 'https://api.klingai.com')
         self.work_dir = Path('video_work')
         self.work_dir.mkdir(exist_ok=True)
+        
+        if not self.kling_access_key or not self.kling_secret_key:
+            raise ValueError("KLING_ACCESS_KEY and KLING_SECRET_KEY environment variables are required")
+    
+    def _generate_jwt_token(self) -> str:
+        """Generate JWT token for Kling AI API authentication"""
+        headers = {
+            "alg": "HS256",
+            "typ": "JWT"
+        }
+        payload = {
+            "iss": self.kling_access_key,  # Issuer is the Access Key
+            "exp": int(time.time()) + 1800,  # Token expires in 30 minutes
+            "nbf": int(time.time()) - 5  # Token valid from 5 seconds ago
+        }
+        token = jwt.encode(payload, self.kling_secret_key, algorithm="HS256", headers=headers)
+        return token
     
     def generate_video_from_image(self, image_path: str, motion_prompt: str, duration: int = 10) -> str:
         """
-        Generate video from image using Runway Gen-4 Turbo
+        Generate video from image using Kling AI
         
         Args:
             image_path: Path to source image or URL
@@ -35,15 +54,19 @@ class VideoGenerationPipeline:
         Returns:
             Path to downloaded video file
         """
-        print(f"🎬 Generating video from image with Runway...")
+        print(f"🎬 Generating video from image with Kling AI...")
         print(f"   Motion prompt: {motion_prompt}")
         print(f"   Duration: {duration}s")
         
-        # Prepare image - either URL or base64
+        # Generate JWT token
+        token = self._generate_jwt_token()
+        
+        # Prepare image - either URL or upload to base64
         if image_path.startswith('http'):
-            prompt_image = image_path
+            image_url = image_path
         else:
-            # Read and encode local file
+            # For Kling AI, we need to provide the image as a URL or base64
+            # Let's use base64 for local files
             with open(image_path, 'rb') as f:
                 image_data = f.read()
             
@@ -55,48 +78,99 @@ class VideoGenerationPipeline:
             else:
                 mime_type = 'image/jpeg'
             
-            prompt_image = f"data:{mime_type};base64,{base64.b64encode(image_data).decode()}"
+            image_url = f"data:{mime_type};base64,{base64.b64encode(image_data).decode()}"
         
         try:
             # Create image-to-video task
-            task = self.runway.image_to_video.create(
-                model='gen4_turbo',
-                prompt_image=prompt_image,
-                prompt_text=motion_prompt,
-                duration=duration,
-                ratio='1280:720'  # 16:9 for YouTube
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
+            
+            payload = {
+                "model_name": "kling-v1-6",  # Using Kling v1.6 model
+                "image": image_url,
+                "prompt": motion_prompt,
+                "mode": "pro",  # Use professional mode for better quality
+                "duration": str(duration),  # Duration as string
+                "aspect_ratio": "16:9"  # 16:9 for YouTube
+            }
+            
+            # Submit the task
+            response = requests.post(
+                f"{self.kling_api_base}/v1/videos/image2video",
+                headers=headers,
+                json=payload,
+                timeout=30
             )
             
-            print(f"   Task created: {task.id}")
-            print(f"   Waiting for generation (this may take 1-3 minutes)...")
+            if response.status_code != 200:
+                raise Exception(f"Kling API error: {response.status_code} - {response.text}")
+            
+            result = response.json()
+            
+            if result.get('code') != 0:
+                raise Exception(f"Kling API error: {result.get('message', 'Unknown error')}")
+            
+            task_id = result['data']['task_id']
+            print(f"   Task created: {task_id}")
+            print(f"   Waiting for generation (this may take 2-5 minutes)...")
             
             # Poll for completion
-            while True:
-                task_status = self.runway.tasks.retrieve(task.id)
-                status = task_status.status
+            video_url = None
+            max_attempts = 120  # 10 minutes max (5 second intervals)
+            attempt = 0
+            
+            while attempt < max_attempts:
+                time.sleep(5)
+                attempt += 1
                 
-                if status == 'SUCCEEDED':
-                    video_url = task_status.output[0]
-                    print(f"   ✅ Video generated successfully!")
-                    break
-                elif status == 'FAILED':
-                    error = getattr(task_status, 'failure', 'Unknown error')
-                    raise Exception(f"Runway generation failed: {error}")
-                elif status in ['PENDING', 'RUNNING']:
-                    print(f"   Status: {status}...")
-                    time.sleep(5)
+                # Check task status
+                status_response = requests.get(
+                    f"{self.kling_api_base}/v1/videos/image2video/{task_id}",
+                    headers=headers,
+                    timeout=30
+                )
+                
+                if status_response.status_code != 200:
+                    print(f"   Warning: Status check failed: {status_response.status_code}")
+                    continue
+                
+                status_result = status_response.json()
+                
+                if status_result.get('code') != 0:
+                    continue
+                
+                task_status = status_result['data']['task_status']
+                
+                if task_status == 'succeed':
+                    videos = status_result['data']['task_result']['videos']
+                    if videos and len(videos) > 0:
+                        video_url = videos[0]['url']
+                        print(f"   ✅ Video generated successfully!")
+                        break
+                elif task_status == 'failed':
+                    error_msg = status_result['data'].get('task_status_msg', 'Unknown error')
+                    raise Exception(f"Kling generation failed: {error_msg}")
                 else:
-                    print(f"   Status: {status}")
-                    time.sleep(5)
+                    # Still processing
+                    if attempt % 6 == 0:  # Print status every 30 seconds
+                        print(f"   Status: {task_status}... ({attempt * 5}s elapsed)")
+            
+            if not video_url:
+                raise Exception("Video generation timed out")
             
             # Download the video
-            import requests
-            video_filename = self.work_dir / f"runway_video_{task.id}.mp4"
+            video_filename = self.work_dir / f"kling_video_{task_id}.mp4"
             
             print(f"   Downloading video...")
-            response = requests.get(video_url)
+            video_response = requests.get(video_url, timeout=120)
+            
+            if video_response.status_code != 200:
+                raise Exception(f"Failed to download video: {video_response.status_code}")
+            
             with open(video_filename, 'wb') as f:
-                f.write(response.content)
+                f.write(video_response.content)
             
             print(f"   ✅ Video saved: {video_filename}")
             return str(video_filename)
@@ -218,7 +292,7 @@ class VideoGenerationPipeline:
         Merge video with audio commentary using FFmpeg
         
         Args:
-            video_path: Path to video file
+            video_path: Path to source video
             audio_path: Path to audio commentary
             output_path: Where to save final video
             
@@ -227,46 +301,49 @@ class VideoGenerationPipeline:
         """
         import subprocess
         
-        print(f"🔀 Merging video and audio...")
+        print(f"🎬 Merging video and audio...")
         
         # Get durations
         video_duration = self._get_media_duration(video_path)
         audio_duration = self._get_media_duration(audio_path)
         
-        print(f"   Video duration: {video_duration:.1f}s")
-        print(f"   Audio duration: {audio_duration:.1f}s")
+        print(f"   Video duration: {video_duration:.2f}s")
+        print(f"   Audio duration: {audio_duration:.2f}s")
         
-        # Strategy: 
-        # - If audio is shorter, video plays with audio then continues silent
-        # - If audio is longer, loop/extend video or trim audio
-        
-        if audio_duration <= video_duration:
-            # Simple case: audio fits within video
+        # Choose strategy based on durations
+        if abs(video_duration - audio_duration) < 0.5:
+            # Durations are similar, simple merge
+            print(f"   Strategy: Simple merge")
             cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-i', audio_path,
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-map', '0:v:0',
-                '-map', '1:a:0',
+                'ffmpeg', '-i', video_path, '-i', audio_path,
+                '-c:v', 'copy', '-c:a', 'aac',
+                '-map', '0:v:0', '-map', '1:a:0',
                 '-shortest',
-                output_path
+                '-y', output_path
+            ]
+        elif audio_duration > video_duration:
+            # Audio is longer, loop video
+            print(f"   Strategy: Loop video to match audio length")
+            cmd = [
+                'ffmpeg',
+                '-stream_loop', '-1', '-i', video_path,
+                '-i', audio_path,
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-map', '0:v:0', '-map', '1:a:0',
+                '-shortest',
+                '-y', output_path
             ]
         else:
-            # Audio is longer - loop video to match audio length
-            print(f"   Looping video to match audio length...")
+            # Video is longer, trim to audio
+            print(f"   Strategy: Trim video to audio length")
             cmd = [
-                'ffmpeg', '-y',
-                '-stream_loop', '-1',  # Loop video infinitely
-                '-i', video_path,
-                '-i', audio_path,
-                '-c:v', 'libx264',
-                '-c:a', 'aac',
-                '-map', '0:v:0',
-                '-map', '1:a:0',
-                '-t', str(audio_duration),  # Trim to audio length
+                'ffmpeg', '-i', video_path, '-i', audio_path,
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-map', '0:v:0', '-map', '1:a:0',
                 '-shortest',
+                '-y',
                 output_path
             ]
         
@@ -351,13 +428,13 @@ TAGS: tag1, tag2, tag3, ...
             script: Commentary script to narrate
             motion_prompt: Prompt describing video motion (optional, generated if not provided)
             voice: TTS voice to use
-            duration: Runway video duration (5 or 10 seconds)
+            duration: Kling video duration (5 or 10 seconds)
             
         Returns:
             Dictionary with file paths and metadata
         """
         print("\n" + "="*70)
-        print("🎬 STARTING VIDEO GENERATION PIPELINE")
+        print("🎬 STARTING VIDEO GENERATION PIPELINE (Kling AI)")
         print("="*70 + "\n")
         
         # Create job directory
@@ -377,7 +454,7 @@ TAGS: tag1, tag2, tag3, ...
             
             # Step 2: Generate video from image
             print("-"*70)
-            print("Step 2: GENERATING VIDEO FROM IMAGE")
+            print("Step 2: GENERATING VIDEO FROM IMAGE (Kling AI)")
             print("-"*70)
             video_path = self.generate_video_from_image(
                 image_path, 

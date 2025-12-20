@@ -56,7 +56,7 @@ def health():
     return jsonify({
         'status': 'healthy' if pipe else 'degraded',
         'pipeline': 'ready' if pipe else pipeline_error,
-        'runway_configured': bool(os.environ.get('RUNWAY_API_KEY')),
+        'kling_configured': bool(os.environ.get('KLING_ACCESS_KEY') and os.environ.get('KLING_SECRET_KEY')),
         'openai_configured': bool(os.environ.get('OPENAI_API_KEY'))
     })
 
