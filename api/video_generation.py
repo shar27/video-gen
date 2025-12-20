@@ -61,35 +61,25 @@ class VideoGenerationPipeline:
         # Generate JWT token
         token = self._generate_jwt_token()
         
-        # Prepare image - either URL or upload to base64
+        # Prepare headers
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        
+        # Prepare image - either URL or raw base64 (no data URI prefix)
         if image_path.startswith('http'):
-            image_url = image_path
+            image_value = image_path
         else:
-            # For Kling AI, we need to provide the image as a URL or base64
-            # Let's use base64 for local files
+            # For Kling AI, send raw base64 without data URI prefix
             with open(image_path, 'rb') as f:
                 image_data = f.read()
-            
-            # Detect mime type
-            if image_path.lower().endswith('.png'):
-                mime_type = 'image/png'
-            elif image_path.lower().endswith('.webp'):
-                mime_type = 'image/webp'
-            else:
-                mime_type = 'image/jpeg'
-            
-            image_url = f"data:{mime_type};base64,{base64.b64encode(image_data).decode()}"
+            image_value = base64.b64encode(image_data).decode('utf-8')
         
         try:
-            # Create image-to-video task
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}"
-            }
-            
             payload = {
                 "model_name": "kling-v1-6",  # Using Kling v1.6 model
-                "image": image_url,
+                "image": image_value,
                 "prompt": motion_prompt,
                 "mode": "pro",  # Use professional mode for better quality
                 "duration": str(duration),  # Duration as string
