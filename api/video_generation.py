@@ -2,7 +2,7 @@
 Video Generation Pipeline
 - Takes an image + script
 - Uses Kling AI to generate video from image
-- Converts script to speech using OpenAI TTS
+- Converts script to speech using ElevenLabs TTS
 - Merges video + audio with FFmpeg
 - Outputs YouTube-ready video
 """
@@ -16,17 +16,68 @@ from pathlib import Path
 from openai import OpenAI
 
 
+# ElevenLabs voice options - British/Documentary style voices
+ELEVENLABS_VOICES = {
+    # Premium documentary voices
+    'george': {
+        'id': 'JBFqnCBsd6RMkjVDRZzb',
+        'name': 'George',
+        'description': 'British, warm, raspy - Perfect for nature documentaries'
+    },
+    'daniel': {
+        'id': 'onwK4e9ZLuTAKqWW03F9',
+        'name': 'Daniel',
+        'description': 'British, authoritative - Great for factual content'
+    },
+    'bill': {
+        'id': 'pqHfZKP75CvOlQylNhV4',
+        'name': 'Bill',
+        'description': 'Older male, trustworthy - Classic narrator voice'
+    },
+    'clyde': {
+        'id': '2EiwWnXFnvU5JabPnv8n',
+        'name': 'Clyde',
+        'description': 'War veteran character - Deep, gravelly'
+    },
+    # Additional voices
+    'adam': {
+        'id': 'pNInz6obpgDQGcFmaJgB',
+        'name': 'Adam',
+        'description': 'Deep, narrative - American male'
+    },
+    'antoni': {
+        'id': 'ErXwobaYiN019PkySvjV',
+        'name': 'Antoni',
+        'description': 'Well-rounded narrator - Young male'
+    },
+    'rachel': {
+        'id': '21m00Tcm4TlvDq8ikWAM',
+        'name': 'Rachel',
+        'description': 'Calm, young female - American'
+    },
+    'drew': {
+        'id': '29vD33N1CtxCmqQRPOHJ',
+        'name': 'Drew',
+        'description': 'News reader - Middle-aged male'
+    },
+}
+
+
 class VideoGenerationPipeline:
     def __init__(self):
         self.openai = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
         self.kling_access_key = os.environ.get('KLING_ACCESS_KEY')
         self.kling_secret_key = os.environ.get('KLING_SECRET_KEY')
         self.kling_api_base = os.environ.get('KLING_API_BASE', 'https://api.klingai.com')
+        self.elevenlabs_api_key = os.environ.get('ELEVEN_LABS_API')
         self.work_dir = Path('video_work')
         self.work_dir.mkdir(exist_ok=True)
         
         if not self.kling_access_key or not self.kling_secret_key:
             raise ValueError("KLING_ACCESS_KEY and KLING_SECRET_KEY environment variables are required")
+        
+        if not self.elevenlabs_api_key:
+            print("⚠️ Warning: ELEVEN_LABS_API not set, falling back to OpenAI TTS")
     
     def _generate_jwt_token(self) -> str:
         """Generate JWT token for Kling AI API authentication"""
@@ -169,33 +220,51 @@ class VideoGenerationPipeline:
             print(f"   ❌ Error generating video: {e}")
             raise
     
-    def convert_script_to_speech(self, script: str, output_path: str, voice: str = 'onyx') -> str:
+    def convert_script_to_speech(self, script: str, output_path: str, voice: str = 'george') -> str:
         """
-        Convert script to speech using OpenAI TTS
-        Handles scripts longer than 4096 characters by chunking
+        Convert script to speech using ElevenLabs TTS (falls back to OpenAI if unavailable)
         
         Args:
             script: The commentary script text
             output_path: Where to save the audio file
-            voice: OpenAI TTS voice (alloy, echo, fable, onyx, nova, shimmer)
+            voice: ElevenLabs voice name (george, daniel, bill, clyde, adam, etc.)
             
         Returns:
             Path to audio file
         """
-        print(f"🎙️ Converting script to speech (voice: {voice})...")
-        
-        MAX_CHARS = 4000  # Leave buffer under 4096 limit
         output_path = Path(output_path)
         
-        # If script is short enough, process directly
+        # Use ElevenLabs if API key is available
+        if self.elevenlabs_api_key:
+            return self._convert_with_elevenlabs(script, output_path, voice)
+        else:
+            print("⚠️ ElevenLabs not configured, using OpenAI TTS...")
+            return self._convert_with_openai(script, output_path, voice)
+    
+    def _convert_with_elevenlabs(self, script: str, output_path: Path, voice: str) -> str:
+        """Convert script to speech using ElevenLabs API"""
+        import subprocess
+        
+        # Get voice ID from our mapping, or use as-is if it looks like an ID
+        voice_lower = voice.lower()
+        if voice_lower in ELEVENLABS_VOICES:
+            voice_id = ELEVENLABS_VOICES[voice_lower]['id']
+            voice_name = ELEVENLABS_VOICES[voice_lower]['name']
+        else:
+            # Assume it's a voice ID directly
+            voice_id = voice
+            voice_name = voice
+        
+        print(f"🎙️ Converting script to speech with ElevenLabs (voice: {voice_name})...")
+        
+        # ElevenLabs has a 5000 character limit per request
+        MAX_CHARS = 4500
+        
         if len(script) <= MAX_CHARS:
-            response = self.openai.audio.speech.create(
-                model="tts-1-hd",
-                voice=voice,
-                input=script,
-                speed=1.0
-            )
-            response.stream_to_file(str(output_path))
+            # Single request
+            audio_data = self._elevenlabs_tts_request(script, voice_id)
+            with open(output_path, 'wb') as f:
+                f.write(audio_data)
             print(f"   ✅ Audio saved: {output_path}")
             return str(output_path)
         
@@ -204,21 +273,14 @@ class VideoGenerationPipeline:
         chunks = self._split_script_into_chunks(script, MAX_CHARS)
         print(f"   Split into {len(chunks)} chunks")
         
-        # Generate audio for each chunk
-        import subprocess
         temp_files = []
-        
         for i, chunk in enumerate(chunks):
             print(f"   Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
             temp_path = output_path.parent / f"{output_path.stem}_chunk_{i}.mp3"
             
-            response = self.openai.audio.speech.create(
-                model="tts-1-hd",
-                voice=voice,
-                input=chunk,
-                speed=1.0
-            )
-            response.stream_to_file(str(temp_path))
+            audio_data = self._elevenlabs_tts_request(chunk, voice_id)
+            with open(temp_path, 'wb') as f:
+                f.write(audio_data)
             temp_files.append(temp_path)
         
         # Concatenate audio files using ffmpeg
@@ -237,6 +299,97 @@ class VideoGenerationPipeline:
         ], check=True, capture_output=True)
         
         # Cleanup temp files
+        for temp_file in temp_files:
+            temp_file.unlink()
+        list_file.unlink()
+        
+        print(f"   ✅ Audio saved: {output_path}")
+        return str(output_path)
+    
+    def _elevenlabs_tts_request(self, text: str, voice_id: str) -> bytes:
+        """Make a single TTS request to ElevenLabs API"""
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": self.elevenlabs_api_key
+        }
+        
+        data = {
+            "text": text,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75,
+                "style": 0.5,
+                "use_speaker_boost": True
+            }
+        }
+        
+        response = requests.post(url, json=data, headers=headers, timeout=120)
+        
+        if response.status_code != 200:
+            raise Exception(f"ElevenLabs API error: {response.status_code} - {response.text}")
+        
+        return response.content
+    
+    def _convert_with_openai(self, script: str, output_path: Path, voice: str) -> str:
+        """Fallback: Convert script to speech using OpenAI TTS"""
+        import subprocess
+        
+        # Map to OpenAI voices if using ElevenLabs voice names
+        openai_voice = 'onyx'  # Default
+        if voice.lower() in ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']:
+            openai_voice = voice.lower()
+        
+        print(f"🎙️ Converting script to speech with OpenAI (voice: {openai_voice})...")
+        
+        MAX_CHARS = 4000
+        
+        if len(script) <= MAX_CHARS:
+            response = self.openai.audio.speech.create(
+                model="tts-1-hd",
+                voice=openai_voice,
+                input=script,
+                speed=1.0
+            )
+            response.stream_to_file(str(output_path))
+            print(f"   ✅ Audio saved: {output_path}")
+            return str(output_path)
+        
+        # Split and process chunks
+        print(f"   Script is {len(script)} chars, splitting into chunks...")
+        chunks = self._split_script_into_chunks(script, MAX_CHARS)
+        print(f"   Split into {len(chunks)} chunks")
+        
+        temp_files = []
+        for i, chunk in enumerate(chunks):
+            print(f"   Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+            temp_path = output_path.parent / f"{output_path.stem}_chunk_{i}.mp3"
+            
+            response = self.openai.audio.speech.create(
+                model="tts-1-hd",
+                voice=openai_voice,
+                input=chunk,
+                speed=1.0
+            )
+            response.stream_to_file(str(temp_path))
+            temp_files.append(temp_path)
+        
+        # Concatenate
+        list_file = output_path.parent / f"{output_path.stem}_filelist.txt"
+        with open(list_file, 'w') as f:
+            for temp_file in temp_files:
+                f.write(f"file '{temp_file.name}'\n")
+        
+        subprocess.run([
+            'ffmpeg', '-f', 'concat', '-safe', '0',
+            '-i', str(list_file),
+            '-c', 'copy',
+            '-y', str(output_path)
+        ], check=True, capture_output=True)
+        
         for temp_file in temp_files:
             temp_file.unlink()
         list_file.unlink()
