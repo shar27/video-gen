@@ -6,7 +6,7 @@ const API_URL = import.meta.env.VITE_API_URL || '/api'
 
 const STEPS = [
   { id: 1, label: 'Uploading image', icon: '📤', duration: 2000 },
-  { id: 2, label: 'Generating video with Runway AI', icon: '🎬', duration: 120000 },
+  { id: 2, label: 'Generating video with Kling AI', icon: '🎬', duration: 180000 },
   { id: 3, label: 'Converting script to speech', icon: '🎙️', duration: 30000 },
   { id: 4, label: 'Merging video & audio', icon: '🔀', duration: 15000 },
   { id: 5, label: 'Generating metadata', icon: '📝', duration: 5000 },
@@ -193,7 +193,7 @@ function App() {
           <p className="subtitle">Image + Script → YouTube Video</p>
         </div>
         <div className="powered-by">
-          Powered by <span>Runway Gen-4</span> & <span>OpenAI</span>
+          Powered by <span>Kling AI</span> & <span>OpenAI</span>
         </div>
       </header>
 
@@ -282,7 +282,7 @@ This will be converted to speech and overlaid on the generated video."
                   <option value={5}>5 seconds</option>
                   <option value={10}>10 seconds</option>
                 </select>
-                <small>Runway video length (audio extends)</small>
+                <small>Kling AI video length (audio extends)</small>
               </div>
             </div>
 
@@ -376,7 +376,7 @@ This will be converted to speech and overlaid on the generated video."
           <ol>
             <li>Upload a source image (photo, illustration, etc.)</li>
             <li>Write your commentary script</li>
-            <li>AI generates video from image using Runway</li>
+            <li>AI generates video from image using Kling AI</li>
             <li>Script is converted to natural speech</li>
             <li>Video and audio are merged together</li>
             <li>YouTube metadata is auto-generated</li>
@@ -386,7 +386,7 @@ This will be converted to speech and overlaid on the generated video."
           <div className="features">
             <h4>✨ Features</h4>
             <ul>
-              <li>Runway Gen-4 Turbo video generation</li>
+              <li>Kling AI Turbo video generation</li>
               <li>6 professional voice options</li>
               <li>Auto-generated motion prompts</li>
               <li>SEO-optimized YouTube metadata</li>
@@ -408,7 +408,7 @@ This will be converted to speech and overlaid on the generated video."
       </main>
 
       <footer className="footer">
-        <p>AI Video Generator • Powered by Runway & OpenAI</p>
+        <p>AI Video Generator • Powered by Kling AI & OpenAI</p>
       </footer>
     </div>
   )
